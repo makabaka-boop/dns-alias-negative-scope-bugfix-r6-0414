@@ -2,9 +2,13 @@
 
 流程：从根提示出发，在“已知最深区割 (zone cut)”向对应权威服务器发
 RD=0 查询；响应是委派（referral）就校验 bailiwick 后吸收 NS/glue 并
-继续，最多 8 跳；响应里有 CNAME 就缓存并跟随，检测环；NXDOMAIN 按
-名称、NODATA 按 (名称,类型) 做负缓存，TTL 取 SOA RR TTL 与 MINIMUM
-的较小值。并发同查询经 :class:`~recdns.singleflight.SingleFlight` 共享。
+继续，最多 8 跳；响应里有 CNAME 就跟随，检测环。answer 区只缓存与
+本次查询同一条链上的记录（从查询名出发的 CNAME 链及链尾答案），
+无关记录与成环响应一律不留缓存。NXDOMAIN/NODATA 都归因到链尾名
+称：NXDOMAIN 按名称、NODATA 按 (名称,类型) 做负缓存，TTL 取 SOA
+RR TTL 与 MINIMUM 的较小值，且仅当 authority 区的 SOA 属主覆盖失败
+名称时才缓存——没有权威依据的失败不能变成可复用结论。并发同查询经
+:class:`~recdns.singleflight.SingleFlight` 共享。
 """
 
 import asyncio
@@ -142,11 +146,15 @@ class RecursiveResolver:
             # 4) 逐台服务器查询，返回可接受的响应及其分类
             response, kind, data = await self._query_servers(current, rdtype, servers)
 
-            # 先缓存 answer 中允许的 RRset（referral 的 answer 里也可能
-            # 携带把名称送出本区的 CNAME）
-            for rrset in response.answer:
-                if rrset.rdtype in ALLOWED_RDTYPES:
-                    self.cache.put_rrset(rrset)
+            # 5) 只采纳与本次查询同一条链上的记录：从 current 出发的
+            # CNAME 链及链尾答案。answer 里的无关记录不进缓存；链成环
+            # 的响应整体作废（_walk_answer 抛 CnameLoop，此处不缓存任
+            # 何记录）。
+            final, local, target = self._walk_answer(response, current, rdtype)
+            for rrset in local:
+                self.cache.put_rrset(rrset)
+            if final is not None and kind == "answer":
+                self.cache.put_rrset(final)
 
             if kind == "referral":
                 hops = self._follow_referral(response, data, hops, qname)
@@ -155,38 +163,53 @@ class RecursiveResolver:
                 continue
 
             if kind == "nxdomain":
-                ttl = self._negative_ttl(response)
+                # NXDOMAIN 判定的是链尾名称（无链时即 current 本身）；
+                # 链上别名本身的存在性不受影响
+                ttl = self._covering_negative_ttl(response, target)
                 if ttl is not None:
-                    self.cache.put_nxdomain(current, ttl)
-                raise NXDOMAINError(current)
+                    self.cache.put_nxdomain(target, ttl)
+                raise NXDOMAINError(target)
 
             if kind == "nodata":
-                ttl = self._negative_ttl(response)
+                ttl = self._covering_negative_ttl(response, target)
                 if ttl is not None:
-                    self.cache.put_nodata(current, rdtype, ttl)
-                raise NoData(current, rdtype)
+                    self.cache.put_nodata(target, rdtype, ttl)
+                raise NoData(target, rdtype)
 
-            # kind == "answer"：沿 answer 区的 CNAME owner 图找出最终答案
-            final, local, target = self._walk_answer(response, current, rdtype)
+            # kind == "answer"：沿 answer 区的 CNAME 链收尾
             chain.extend(local)
+            if local:
+                seen.update(rr.name for rr in local)
+                if target in seen:  # 与之前响应的链闭环
+                    raise CnameLoop(f"CNAME loop at {target}")
+                seen.add(target)
+                if len(chain) > _MAX_CNAMES:
+                    raise CnameLoop("CNAME chain too long")
             if final is not None:
                 return Answer(qname, rdtype, target, list(chain), [final])
             if rdtype == dns.rdatatype.CNAME and local:
                 return Answer(qname, rdtype, target, list(chain), [])
 
             # CNAME 指向的新名称没有答案：若权威区同时给出了对目标的
-            # 委派，则吸收后跟随；否则按 NODATA 处理
+            # 委派，则吸收后跟随
             cut = self._referral_cut(response, target)
             if cut is not None:
                 hops = self._follow_referral(response, cut, hops, qname)
-                current = self._advance_over_cached_cnames(current, chain, seen)
+                current = self._advance_over_cached_cnames(target, chain, seen)
                 continue
 
-            # 只有当权威区的 SOA 属主覆盖链尾时才做负缓存；
-            # 否则保守地只报错不缓存
-            ttl = self._negative_ttl_if_covering(response, target)
+            # 权威区的 SOA 属主覆盖链尾：本应答即链尾的 NODATA 结论，
+            # 按 (链尾, 类型) 负缓存
+            ttl = self._covering_negative_ttl(response, target)
             if ttl is not None:
                 self.cache.put_nodata(target, rdtype, ttl)
+                raise NoData(target, rdtype)
+
+            # 链尾不在该权威区（无委派、无 SOA 覆盖）：本次失败没有权
+            # 威依据，不缓存；从链尾重新定位区割继续解析
+            if local:
+                current = self._advance_over_cached_cnames(target, chain, seen)
+                continue
             raise NoData(target, rdtype)
 
     def _follow_referral(self, response, cut_name, hops, qname) -> int:
@@ -445,16 +468,13 @@ class RecursiveResolver:
                 return rrset
         return None
 
-    def _negative_ttl(self, response) -> int | None:
-        """负缓存期限：SOA RR TTL 与 MINIMUM 的较小值；无 SOA 不缓存。"""
-        soa = self._authority_soa(response)
-        if soa is None:
-            return None
-        self.cache.put_rrset(soa)
-        return max(0, min(soa.ttl, soa[0].minimum))
+    def _covering_negative_ttl(self, response, name) -> int | None:
+        """负缓存期限：SOA RR TTL 与 MINIMUM 的较小值。
 
-    def _negative_ttl_if_covering(self, response, name) -> int | None:
-        """同 :meth:`_negative_ttl`，但要求 SOA 属主是 ``name`` 的后缀。"""
+        仅当 authority 区的 SOA 属主覆盖 ``name`` 时才返回期限（并把
+        该 SOA 入缓存）；否则这次失败没有对应的权威依据，不能缓存成
+        可复用结论。
+        """
         soa = self._authority_soa(response)
         if soa is None or not name.is_subdomain(soa.name):
             return None

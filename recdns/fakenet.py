@@ -184,14 +184,21 @@ class Zone:
 
         # 2) CNAME 链（链上落在本区的记录）
         if rdtype != dns.rdatatype.CNAME:
-            chain, final, target = self._follow_cnames(qname, rdtype)
+            chain, final, target, looped = self._follow_cnames(qname, rdtype)
             if chain:
                 if final is not None:
                     return self._aa(qname, rdtype, chain + [final])
+                if looped:
+                    # 环：把环原样返回，由解析器检测
+                    return self._aa(qname, rdtype, chain)
                 # 链尾不在本区：权威 CNAME + 对链尾的委派（若存在）
                 cut = self._matching_delegation(target)
                 if cut is not None:
                     return self._referral(qname, rdtype, chain, cut)
+                if target.is_subdomain(self.origin):
+                    # 链尾落在本区：与真实权威一致，对链尾给出
+                    # NXDOMAIN / NODATA，answer 携带整条别名链
+                    return self._negative_for_target(qname, rdtype, chain, target)
                 return self._aa(qname, rdtype, chain)  # 权威但不完整
 
         # 3) 区顶 NS
@@ -215,24 +222,37 @@ class Zone:
         return resp
 
     def _follow_cnames(self, start, rdtype):
-        """返回 (别名链, 最终记录或 None, 链尾名称)。"""
+        """返回 (别名链, 最终记录或 None, 链尾名称, 是否成环)。"""
         chain = []
         cur = start
         seen = {start}
         while True:
             cn = self._records.get((cur, dns.rdatatype.CNAME))
             if cn is None:
-                break
+                return chain, None, cur, False
             target = cn[0].target
             chain.append(cn)
-            if target in seen:  # 环：把环原样返回，由解析器检测
-                return chain, None, target
+            if target in seen:  # 环
+                return chain, None, target, True
             seen.add(target)
             final = self._records.get((target, rdtype))
             if final is not None:
-                return chain, final, target
+                return chain, final, target, False
             cur = target
-        return chain, None, cur
+
+    def _negative_for_target(self, qname, rdtype, chain, target):
+        """链尾在本区但无法给出所求记录：NXDOMAIN 或 NODATA。
+
+        answer 携带整条别名链，authority 附本区 SOA（除非配置为剥离）。
+        """
+        owner_exists = any(n == target for n, _t in self._records)
+        rcode = dns.rcode.NOERROR if owner_exists else dns.rcode.NXDOMAIN
+        resp = self._reply(qname, rdtype, rcode)
+        resp.flags |= dns.flags.AA
+        resp.answer.extend(chain)
+        if not self.strip_negative_soa:
+            resp.authority.append(self.soa_rrset())
+        return resp
 
     def _aa(self, qname, rdtype, answer):
         resp = self._reply(qname, rdtype, dns.rcode.NOERROR)

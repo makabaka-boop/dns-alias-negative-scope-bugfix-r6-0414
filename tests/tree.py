@@ -81,6 +81,14 @@ def build_tree(clock):
     # 别名跨区且目标在 org.test. 内不存在：NXDOMAIN 应按目标名称缓存
     test.add("dead.test.", "CNAME", "ghost.org.test.", ttl=100)
 
+    # 多级别名指向暂时不存在的同区目标（测试中用 add("gone3.test.", ...)
+    # 模拟目标稍后恢复）；否定结论应只落在链尾 gone3.test.
+    test.add("gone1.test.", "CNAME", "gone2.test.", ttl=100)
+    test.add("gone2.test.", "CNAME", "gone3.test.", ttl=100)
+    # 多级别名指向存在但缺少指定记录的目标：NODATA 按 (链尾, 类型) 缓存
+    test.add("void1.test.", "CNAME", "void2.test.", ttl=100)
+    test.add("void2.test.", "A", "6.6.6.6", ttl=100)
+
     # tld 提供 ns.other.tld 的 A 记录（区外 NS 的正常解析路径）
     tld = Zone("tld.", soa_ttl=3600, minimum=300)
     tld.add("tld.", "NS", "ns.tld.", ttl=300)

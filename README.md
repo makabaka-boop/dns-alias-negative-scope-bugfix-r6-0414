@@ -11,11 +11,12 @@
 | 从配置根逐级跟随委派，最多 8 跳 | `resolver._follow_referral` / `MAX_REFERRAL_HOPS` |
 | glue 必须属于所委派区域且对应 NS 名称 | `resolver._absorb_referral` |
 | CNAME 跟随与环检测 | `resolver._walk_cache` / `_walk_answer` / `_advance_over_cached_cnames` |
+| answer 区只缓存与查询同链的记录；无关记录与成环响应不留缓存 | `resolver._resolve` / `_walk_answer` |
 | UDP 收到 TC 后 TCP 重试 | `transport.AsyncioTransport` |
 | 正缓存按 TTL 失效 | `cache.Cache.get_rrset` |
-| NXDOMAIN 按名称缓存 | `cache.Cache.put_nxdomain`（类型用通配键） |
-| 无该类型按 (名称,类型) 缓存 | `cache.Cache.put_nodata` |
-| 负缓存 TTL = min(SOA RR TTL, SOA MINIMUM) | `resolver._negative_ttl`，无 SOA 不缓存 |
+| NXDOMAIN 按名称缓存（归因 CNAME 链尾） | `cache.Cache.put_nxdomain`（类型用通配键） |
+| 无该类型按 (名称,类型) 缓存（归因 CNAME 链尾） | `cache.Cache.put_nodata` |
+| 负缓存 TTL = min(SOA RR TTL, SOA MINIMUM)，SOA 须覆盖失败名称 | `resolver._covering_negative_ttl`，无覆盖 SOA 不缓存 |
 | 相同查询共享进行中的上游请求 | `singleflight.SingleFlight` |
 | 一个等待者取消不影响其他等待者 | 每个等待者私有 Future + 工厂独立任务 |
 | 可控时钟 | `clock.FakeClock` |
@@ -58,6 +59,11 @@ python3 -m pytest tests/ -q
 * **别名链**：区内多级 CNAME、跨区 CNAME（权威在 answer 给 CNAME、
   authority 给目标区委派）、CNAME 环、跨区别名目标 NXDOMAIN 按目标名
   缓存。
+* **链尾否定结论**：多级别名指向不存在/缺记录的目标时，NXDOMAIN 按
+  链尾名称、NODATA 按 (链尾, 类型) 负缓存；别名自身的 CNAME 按各自
+  TTL 保留，冷热查询报告同一失败名称；目标恢复后负缓存到期即可得到
+  新结果；SOA 不覆盖失败名称的负响应不缓存；answer 里的无关记录与
+  成环响应不留缓存。
 * **负缓存边界**：SOA TTL 120 / MIN 60 缓存 60 秒；SOA TTL 30 /
   MIN 3600 缓存 30 秒；恰好到期重查；负响应缺 SOA 时不缓存；NODATA
   只对 (名称, 类型) 生效。

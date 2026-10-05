@@ -10,12 +10,12 @@
 | --- | --- |
 | 从配置根逐级跟随委派，最多 8 跳 | `resolver._follow_referral` / `MAX_REFERRAL_HOPS` |
 | glue 必须属于所委派区域且对应 NS 名称 | `resolver._absorb_referral` |
-| CNAME 跟随与环检测 | `resolver._walk_cache` / `_walk_answer` / `_advance_over_cached_cnames` |
+| CNAME 跟随与环检测 | `resolver._walk_cache` / `_walk_answer` / `_commit_cnames_and_advance` |
 | UDP 收到 TC 后 TCP 重试 | `transport.AsyncioTransport` |
 | 正缓存按 TTL 失效 | `cache.Cache.get_rrset` |
 | NXDOMAIN 按名称缓存 | `cache.Cache.put_nxdomain`（类型用通配键） |
 | 无该类型按 (名称,类型) 缓存 | `cache.Cache.put_nodata` |
-| 负缓存 TTL = min(SOA RR TTL, SOA MINIMUM) | `resolver._negative_ttl`，无 SOA 不缓存 |
+| 负缓存 TTL = 覆盖链尾 SOA 的 RR TTL 与 MINIMUM 较小值 | `resolver._negative_ttl_if_covering`，无覆盖 SOA 不缓存 |
 | 相同查询共享进行中的上游请求 | `singleflight.SingleFlight` |
 | 一个等待者取消不影响其他等待者 | 每个等待者私有 Future + 工厂独立任务 |
 | 可控时钟 | `clock.FakeClock` |

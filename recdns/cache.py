@@ -68,6 +68,21 @@ class Cache:
         self._negative.pop(key, None)
         self._negative.pop((rrset.name, NXDOMAIN), None)
 
+    def discard_rrset(self, name: dns.name.Name, rdtype: int) -> None:
+        """删除一条正缓存；用于撤销刚发现会构成环的别名。"""
+        self._positive.pop((name, rdtype), None)
+
+    def take_rrset(
+        self, name: dns.name.Name, rdtype: int
+    ) -> dns.rrset.RRset | None:
+        """读取并移除一条仍有效的正缓存，用于回滚时暂存旧值。"""
+        rec = self._positive.pop((name, rdtype), None)
+        if rec is None or rec.expires <= self._clock.monotonic():
+            return None
+        out = copy.copy(rec.rrset)
+        out.ttl = max(0, int(rec.expires - self._clock.monotonic()))
+        return out
+
     def get_rrset(self, name: dns.name.Name, rdtype: int) -> dns.rrset.RRset | None:
         rec = self._positive.get((name, rdtype))
         if rec is None:

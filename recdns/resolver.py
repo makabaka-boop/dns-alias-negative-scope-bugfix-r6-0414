@@ -2,9 +2,10 @@
 
 流程：从根提示出发，在“已知最深区割 (zone cut)”向对应权威服务器发
 RD=0 查询；响应是委派（referral）就校验 bailiwick 后吸收 NS/glue 并
-继续，最多 8 跳；响应里有 CNAME 就缓存并跟随，检测环；NXDOMAIN 按
-名称、NODATA 按 (名称,类型) 做负缓存，TTL 取 SOA RR TTL 与 MINIMUM
-的较小值。并发同查询经 :class:`~recdns.singleflight.SingleFlight` 共享。
+继续，最多 8 跳；只跟随并缓存与本次查询连通的 CNAME 并检测环；NXDOMAIN
+按名称、NODATA 按 (名称,类型) 做负缓存，且仅缓存覆盖链尾的权威 SOA 所给出
+的 TTL（SOA RR TTL 与 MINIMUM 的较小值）。并发同查询经
+:class:`~recdns.singleflight.SingleFlight` 共享。
 """
 
 import asyncio
@@ -111,19 +112,38 @@ class RecursiveResolver:
     async def _resolve(self, qname: dns.name.Name, rdtype: int) -> Answer:
         seen: set[dns.name.Name] = {qname}
         chain: list[dns.rrset.RRset] = []
+        learned_cnames: set[dns.name.Name] = set()
+
+        def discard_learned_cnames() -> None:
+            for owner in tuple(learned_cnames):
+                self.cache.discard_rrset(owner, dns.rdatatype.CNAME)
+                learned_cnames.discard(owner)
+
         current = qname
         hops = 0
 
         while True:
-            # 1) 负缓存
-            neg = self.cache.negative_status(current, rdtype)
-            if neg == "nxdomain":
-                raise NXDOMAINError(current)
-            if neg == "nodata":
-                raise NoData(current, rdtype)
+            # 1) 负缓存。显式查 CNAME 时，CNAME 正缓存优先：存在别名即
+            # 说明该名称存在，类型特定的旧负结论不能遮蔽别名查询。
+            if rdtype == dns.rdatatype.CNAME:
+                if (
+                    self.cache.get_rrset(current, dns.rdatatype.CNAME) is None
+                    and self.cache.negative_status(current, rdtype) == "nxdomain"
+                ):
+                    raise NXDOMAINError(current)
+            else:
+                neg = self.cache.negative_status(current, rdtype)
+                if neg == "nxdomain":
+                    raise NXDOMAINError(current)
+                if neg == "nodata":
+                    raise NoData(current, rdtype)
 
             # 2) 正缓存：沿 CNAME 走，能在缓存内答完就直接返回
-            hit = self._walk_cache(qname, rdtype, current, chain, seen)
+            try:
+                hit = self._walk_cache(qname, rdtype, current, chain, seen)
+            except CnameLoop:
+                discard_learned_cnames()
+                raise
             if hit is not None:
                 return hit
             # 缓存若新加了别名，下一轮从链尾继续（_walk_cache 已把
@@ -142,48 +162,100 @@ class RecursiveResolver:
             # 4) 逐台服务器查询，返回可接受的响应及其分类
             response, kind, data = await self._query_servers(current, rdtype, servers)
 
-            # 先缓存 answer 中允许的 RRset（referral 的 answer 里也可能
-            # 携带把名称送出本区的 CNAME）
-            for rrset in response.answer:
-                if rrset.rdtype in ALLOWED_RDTYPES:
-                    self.cache.put_rrset(rrset)
+            # 只暂存本次响应中从查询名连通可达的记录；环在行走阶段抛出，
+            # 因而不会把构成环的 CNAME 写入缓存。
+            new_rrsets: list[dns.rrset.RRset] = []
+            try:
+                final, local, target = self._walk_answer(
+                    response, current, rdtype, seen
+                )
+            except CnameLoop:
+                discard_learned_cnames()
+                raise
+            if kind == "answer":
+                new_rrsets.extend(local)
+                if final is not None:
+                    new_rrsets.append(final)
 
             if kind == "referral":
+                if rdtype == dns.rdatatype.CNAME and local:
+                    self._commit_rrsets(local, learned_cnames)
+                    return Answer(qname, rdtype, target, list(local), [])
                 hops = self._follow_referral(response, data, hops, qname)
-                # answer 里若带有把名称送出本区的 CNAME，推进到链尾
-                current = self._advance_over_cached_cnames(current, chain, seen)
+                if local:
+                    current = self._commit_cnames_and_advance(
+                        local, target, chain, seen, learned_cnames
+                    )
                 continue
 
             if kind == "nxdomain":
-                ttl = self._negative_ttl(response)
+                # 先跟随从本次响应接上的已缓存别名，确保冷查询与缓存查询
+                # 报告同一个链尾名称。
+                if local:
+                    tail = self._commit_cnames_and_advance(
+                        local, target, chain, seen, learned_cnames
+                    )
+                else:
+                    tail = current
+                ttl = self._negative_ttl_if_covering(response, tail)
                 if ttl is not None:
-                    self.cache.put_nxdomain(current, ttl)
-                raise NXDOMAINError(current)
+                    self.cache.put_nxdomain(tail, ttl)
+                    raise NXDOMAINError(tail)
+                if local:
+                    current = tail
+                    continue
+                raise NXDOMAINError(tail)
 
             if kind == "nodata":
-                ttl = self._negative_ttl(response)
+                if rdtype == dns.rdatatype.CNAME and local:
+                    # 显式查询 CNAME 时，权威应答中的该 CNAME 就是成功答案。
+                    self._commit_rrsets(local, learned_cnames)
+                    chain.extend(local)
+                    return Answer(qname, rdtype, target, list(chain), [])
+
+                tail = target
+                if local:
+                    tail = self._commit_cnames_and_advance(
+                        local, target, chain, seen, learned_cnames
+                    )
+                ttl = self._negative_ttl_if_covering(response, tail)
                 if ttl is not None:
-                    self.cache.put_nodata(current, rdtype, ttl)
-                raise NoData(current, rdtype)
+                    self.cache.put_nodata(tail, rdtype, ttl)
+                    raise NoData(tail, rdtype)
+                if local:
+                    # 别名有效，但链尾的否定结论没有可复用的授权依据。
+                    current = tail
+                    continue
+                raise NoData(tail, rdtype)
 
             # kind == "answer"：沿 answer 区的 CNAME owner 图找出最终答案
-            final, local, target = self._walk_answer(response, current, rdtype)
-            chain.extend(local)
             if final is not None:
+                chain.extend(local)
+                self._commit_rrsets(new_rrsets, learned_cnames)
                 return Answer(qname, rdtype, target, list(chain), [final])
             if rdtype == dns.rdatatype.CNAME and local:
-                return Answer(qname, rdtype, target, list(chain), [])
+                self._commit_rrsets(local, learned_cnames)
+                return Answer(qname, rdtype, target, list(local), [])
 
-            # CNAME 指向的新名称没有答案：若权威区同时给出了对目标的
-            # 委派，则吸收后跟随；否则按 NODATA 处理
+            # 别名已提交；若响应同时给出了对链尾的委派，则吸收后跟随。
             cut = self._referral_cut(response, target)
             if cut is not None:
                 hops = self._follow_referral(response, cut, hops, qname)
-                current = self._advance_over_cached_cnames(current, chain, seen)
+                if local:
+                    current = self._commit_cnames_and_advance(
+                        local, target, chain, seen, learned_cnames
+                    )
                 continue
 
-            # 只有当权威区的 SOA 属主覆盖链尾时才做负缓存；
-            # 否则保守地只报错不缓存
+            if local:
+                current = self._commit_cnames_and_advance(
+                    local, target, chain, seen, learned_cnames
+                )
+                # 响应可能只给出了暂时缺失的别名目标；继续沿链尾查询，
+                # 只有覆盖链尾的权威 SOA 才能形成可复用的否定结论。
+                continue
+
+            # AA 空响应：只有覆盖名称的 SOA 才允许负缓存。
             ttl = self._negative_ttl_if_covering(response, target)
             if ttl is not None:
                 self.cache.put_nodata(target, rdtype, ttl)
@@ -198,22 +270,64 @@ class RecursiveResolver:
         self._absorb_referral(response, cut_name)
         return hops + 1
 
-    def _advance_over_cached_cnames(self, current, chain, seen):
-        """referral 前 answer 里的 CNAME 已入缓存，沿它推进查询名。"""
+    def _commit_rrsets(self, rrsets, learned_cnames=None):
+        """只提交与本次答案链连通、且已通过环检测的 RRset。"""
+        for rrset in rrsets:
+            if (
+                rrset.rdclass != dns.rdataclass.IN
+                or rrset.rdtype not in ALLOWED_RDTYPES
+            ):
+                continue
+            self.cache.put_rrset(rrset)
+            if (
+                rrset.rdtype == dns.rdatatype.CNAME
+                and learned_cnames is not None
+            ):
+                learned_cnames.add(rrset.name)
+
+    def _commit_cnames_and_advance(
+        self, rrsets, target, chain, seen, learned_cnames
+    ):
+        """提交响应中的别名；若它们接上已缓存别名则继续走到链尾。"""
+        old_rrsets = []
+        new_owners = []
+        for rrset in rrsets:
+            old_rrsets.append(
+                self.cache.take_rrset(rrset.name, dns.rdatatype.CNAME)
+            )
+            new_owners.append(rrset.name)
+        self._commit_rrsets(rrsets, learned_cnames)
+        seen.update(rr.name for rr in rrsets)
+        seen.add(target)
+        chain.extend(rrsets)
+        try:
+            return self._extend_chain_with_cached_cnames(target, chain, seen)
+        except CnameLoop:
+            for owner, old in zip(new_owners, old_rrsets):
+                if old is not None:
+                    self.cache.put_rrset(old)
+                else:
+                    self.cache.discard_rrset(owner, dns.rdatatype.CNAME)
+                learned_cnames.discard(owner)
+            raise
+
+    def _extend_chain_with_cached_cnames(self, current, chain, seen):
+        """提交新别名后，继续穿过此前已缓存的连通别名，返回链尾。"""
         cur = current
-        local_seen: set[dns.name.Name] = set()
+        local_seen: set[dns.name.Name] = {cur}
         while True:
             cname = self.cache.get_rrset(cur, dns.rdatatype.CNAME)
             if cname is None:
                 return cur
-            if cur in local_seen or cname[0].target in seen:
-                raise CnameLoop(f"CNAME loop at {cname[0].target}")
-            local_seen.add(cur)
+            target = cname[0].target
+            if target in seen or target in local_seen:
+                raise CnameLoop(f"CNAME loop at {target}")
+            local_seen.add(target)
             if len(chain) >= _MAX_CNAMES:
                 raise CnameLoop("CNAME chain too long")
             chain.append(cname)
-            seen.add(cname[0].target)
-            cur = cname[0].target
+            seen.add(target)
+            cur = target
 
     # ---------------------------------------------------------- 缓存链行走
 
@@ -233,11 +347,31 @@ class RecursiveResolver:
             cname = self.cache.get_rrset(cur, dns.rdatatype.CNAME)
             if cname is None:
                 break
+            target = cname[0].target
+            if (
+                rdtype != dns.rdatatype.CNAME
+                and (target in seen or target in local_seen)
+            ):
+                raise CnameLoop(f"CNAME loop at {target}")
             local.append(cname)
             if rdtype == dns.rdatatype.CNAME and cur == start:
+                if target == start or target in seen:
+                    raise CnameLoop(f"CNAME loop at {target}")
+                probe_seen = {start, target}
+                probe = target
+                while True:
+                    probe_cname = self.cache.get_rrset(
+                        probe, dns.rdatatype.CNAME
+                    )
+                    if probe_cname is None:
+                        break
+                    probe_target = probe_cname[0].target
+                    if probe_target in probe_seen:
+                        raise CnameLoop(f"CNAME loop at {probe_target}")
+                    probe_seen.add(probe_target)
+                    probe = probe_target
                 chain.extend(local)
-                return Answer(qname, rdtype, cname[0].target, list(chain))
-            target = cname[0].target
+                return Answer(qname, rdtype, target, list(chain))
             neg = self.cache.negative_status(target, rdtype)
             if neg == "nxdomain":
                 raise NXDOMAINError(target)
@@ -278,12 +412,22 @@ class RecursiveResolver:
 
         rcode = response.rcode()
         if rcode == dns.rcode.NXDOMAIN:
-            return ("nxdomain", None)
+            # 只接受权威服务器对其区域作出的 NXDOMAIN；非权威否定结论
+            # 没有可复用的授权依据。
+            return ("nxdomain", None) if response.flags & dns.flags.AA else (
+                "error",
+                "non-authoritative NXDOMAIN",
+            )
         if rcode != dns.rcode.NOERROR:
             return ("error", f"rcode {dns.rcode.to_text(rcode)}")
 
         if response.flags & dns.flags.AA:
-            return ("answer", None) if response.answer else ("nodata", None)
+            _final, chain, _target = self._walk_answer(response, qname, rdtype)
+            return (
+                ("answer", None)
+                if (chain or _final is not None)
+                else ("nodata", None)
+            )
 
         # 非权威：answer 里可能先有把名称送出本区的 CNAME，权威区
         # 同时给出对链尾（或 qname 本身）的委派——仍算 referral
@@ -341,27 +485,57 @@ class RecursiveResolver:
 
     # ---------------------------------------------------------- answer 行走
 
-    @staticmethod
-    def _walk_answer(response, start, rdtype):
-        """沿 answer 区的 CNAME 图行走。
+    def _walk_answer(self, response, start, rdtype, seen=None):
+        """沿 answer 区中从 ``start`` 连通的 CNAME 图行走。
 
         返回 (final_rrset|None, 别名链, 终点名称)；遇到环抛 CnameLoop。
+        answer 区中与本查询链无关的名称不会进入结果，自然也不会被缓存。
         """
         owners = {
             (rr.name, rr.rdtype): rr
             for rr in response.answer
-            if rr.rdtype in ALLOWED_RDTYPES
+            if rr.rdclass == dns.rdataclass.IN and rr.rdtype in ALLOWED_RDTYPES
         }
         cur = start
+        prior_seen = set(seen or ())
         local_seen = {start}
         local: list[dns.rrset.RRset] = []
         while True:
             cname = owners.get((cur, dns.rdatatype.CNAME))
             if cname is not None:
-                if rdtype == dns.rdatatype.CNAME and cur == start:
-                    return None, [cname], cname[0].target
                 target = cname[0].target
-                if target in local_seen:
+                if rdtype == dns.rdatatype.CNAME and cur == start:
+                    cname_target = cname[0].target
+                    if cname_target == start or cname_target in prior_seen:
+                        raise CnameLoop(f"CNAME loop at {cname_target}")
+                    probe_seen = {start, cname_target}
+                    probe = cname_target
+                    while probe in owners:
+                        next_cname = owners[(probe, dns.rdatatype.CNAME)]
+                        next_target = next_cname[0].target
+                        if (
+                            next_target in probe_seen
+                            or next_target in prior_seen
+                        ):
+                            raise CnameLoop(f"CNAME loop at {next_target}")
+                        probe_seen.add(next_target)
+                        probe = next_target
+                    while True:
+                        next_cname = self.cache.get_rrset(
+                            probe, dns.rdatatype.CNAME
+                        )
+                        if next_cname is None:
+                            break
+                        next_target = next_cname[0].target
+                        if (
+                            next_target in probe_seen
+                            or next_target in prior_seen
+                        ):
+                            raise CnameLoop(f"CNAME loop at {next_target}")
+                        probe_seen.add(next_target)
+                        probe = next_target
+                    return None, [cname], cname_target
+                if target in prior_seen or target in local_seen:
                     raise CnameLoop(f"CNAME loop at {target}")
                 local_seen.add(target)
                 if len(local) >= _MAX_CNAMES:
@@ -445,18 +619,15 @@ class RecursiveResolver:
                 return rrset
         return None
 
-    def _negative_ttl(self, response) -> int | None:
-        """负缓存期限：SOA RR TTL 与 MINIMUM 的较小值；无 SOA 不缓存。"""
-        soa = self._authority_soa(response)
-        if soa is None:
-            return None
-        self.cache.put_rrset(soa)
-        return max(0, min(soa.ttl, soa[0].minimum))
-
     def _negative_ttl_if_covering(self, response, name) -> int | None:
-        """同 :meth:`_negative_ttl`，但要求 SOA 属主是 ``name`` 的后缀。"""
-        soa = self._authority_soa(response)
-        if soa is None or not name.is_subdomain(soa.name):
+        """返回可缓存的否定 TTL；要求权威 SOA 属主实际覆盖 ``name``。"""
+        if not (response.flags & dns.flags.AA):
             return None
-        self.cache.put_rrset(soa)
+        soa = RecursiveResolver._authority_soa(response)
+        if (
+            soa is None
+            or soa.rdclass != dns.rdataclass.IN
+            or not name.is_subdomain(soa.name)
+        ):
+            return None
         return max(0, min(soa.ttl, soa[0].minimum))
